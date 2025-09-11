@@ -16,6 +16,9 @@ class MeasurementEdge:
     distance: float
     quality: float  # 0-1 quality score
     variance: float  # Measurement variance
+    multipath_severity: float = 0.0  # 0=no multipath, 1=severe
+    whitening_applied: bool = False  # Whether whitening was applied
+    residual_bias: float = 0.0  # Expected bias after processing
 
 
 class RobustLocalizer:
@@ -35,6 +38,7 @@ class RobustLocalizer:
         self.max_iterations = 100
         self.convergence_threshold = 1e-6
         self.epsilon = 1e-10  # For numerical stability
+        self.adaptive_huber = True  # Adapt Huber delta based on multipath
         
     def huber_loss(self, residual: float) -> float:
         """
@@ -67,6 +71,69 @@ class RobustLocalizer:
             return 1.0
         else:
             return self.huber_delta / abs_r if abs_r > 0 else 1.0
+    
+    def adapt_huber_delta(self, measurements: List[MeasurementEdge]) -> float:
+        """
+        Adapt Huber delta based on multipath severity and whitening status
+        
+        Args:
+            measurements: List of measurements with multipath info
+            
+        Returns:
+            Adapted Huber delta
+        """
+        if not self.adaptive_huber:
+            return self.huber_delta
+            
+        # Compute average multipath severity
+        multipath_severities = [m.multipath_severity for m in measurements]
+        avg_severity = np.mean(multipath_severities) if multipath_severities else 0.0
+        
+        # Count whitened measurements
+        whitened_count = sum(1 for m in measurements if m.whitening_applied)
+        whitening_ratio = whitened_count / len(measurements) if measurements else 0.0
+        
+        # Adapt Huber delta
+        if whitening_ratio > 0.8:
+            # Most measurements whitened - can be more aggressive
+            adapted_delta = self.huber_delta * (0.1 + 0.9 * (1 - avg_severity))
+        elif whitening_ratio > 0.5:
+            # Partial whitening - moderate approach
+            adapted_delta = self.huber_delta * (0.3 + 0.7 * (1 - avg_severity))
+        else:
+            # Little/no whitening - conservative approach
+            adapted_delta = self.huber_delta * (0.5 + 0.5 * (1 - avg_severity))
+            
+        return adapted_delta
+    
+    def compute_measurement_weight(self, edge: MeasurementEdge) -> float:
+        """
+        Compute weight for measurement based on quality and multipath
+        
+        Args:
+            edge: Measurement edge with metadata
+            
+        Returns:
+            Weight for this measurement
+        """
+        # Base weight from quality score
+        base_weight = edge.quality
+        
+        # Adjust for multipath
+        if edge.whitening_applied:
+            # Whitening applied - trust more
+            multipath_factor = 1.0 - 0.3 * edge.multipath_severity
+        else:
+            # No whitening - trust less with multipath
+            multipath_factor = 1.0 - 0.7 * edge.multipath_severity
+            
+        # Account for expected residual bias
+        bias_factor = 1.0 / (1.0 + abs(edge.residual_bias))
+        
+        # Combined weight
+        weight = base_weight * multipath_factor * bias_factor
+        
+        return max(weight, 0.1)  # Minimum weight to avoid numerical issues
     
     def compute_residuals(self, positions: np.ndarray, 
                          measurements: List[MeasurementEdge],

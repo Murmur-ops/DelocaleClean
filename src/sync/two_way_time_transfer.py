@@ -1,12 +1,20 @@
 """
 Two-Way Time Transfer (TWTT) for High-Precision Time Synchronization
 Optimal for FTL (Frequency-Time Localization) systems
+Enhanced with multipath whitening for improved accuracy
 """
 
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
 from collections import deque
+
+# Import multipath whitening if available
+try:
+    from ..signal_processing.multipath_whitening import MultipathWhiteningFilter
+    WHITENING_AVAILABLE = True
+except ImportError:
+    WHITENING_AVAILABLE = False
 
 
 @dataclass
@@ -28,12 +36,19 @@ class TWTTConfig:
     # Asymmetry estimation
     estimate_asymmetry: bool = True  # Estimate path asymmetry
     asymmetry_alpha: float = 0.01    # Learning rate for asymmetry
+    
+    # Multipath whitening parameters
+    enable_whitening: bool = True  # Enable multipath whitening
+    whitening_regularization: float = 0.01  # MMSE regularization parameter
+    whitening_filter_length: int = 256  # Whitening filter taps
+    signal_bandwidth_mhz: float = 200.0  # Signal bandwidth for whitening
 
 
 class TWTTNode:
     """
     Two-Way Time Transfer implementation for a single node
     Provides high-precision time synchronization for FTL
+    Enhanced with multipath whitening for improved accuracy
     """
     
     def __init__(self, node_id: int, config: TWTTConfig = TWTTConfig()):
@@ -51,6 +66,15 @@ class TWTTNode:
         # Statistics
         self.sync_accuracy_ns = float('inf')
         self.sync_precision_ns = float('inf')
+        
+        # Multipath whitening filter
+        self.whitening_filter = None
+        if config.enable_whitening and WHITENING_AVAILABLE:
+            self.whitening_filter = MultipathWhiteningFilter(
+                regularization=config.whitening_regularization,
+                filter_length=config.whitening_filter_length,
+                bandwidth_mhz=config.signal_bandwidth_mhz
+            )
         
     def initiate_twtt_exchange(self, neighbor_id: int) -> Dict:
         """
@@ -99,6 +123,7 @@ class TWTTNode:
     def process_twtt_response(self, message: Dict) -> Dict:
         """
         Process TWTT response and calculate time offset
+        Enhanced with optional multipath whitening
         """
         t4 = self.get_hardware_timestamp()  # Receive timestamp
         
@@ -106,6 +131,13 @@ class TWTTNode:
         t2 = message['t2']
         t3 = message['t3']
         neighbor_id = message['from_node']
+        
+        # Apply whitening if available and configured
+        if self.whitening_filter is not None and 'channel_impulse_response' in message:
+            # Process timestamps through whitening filter
+            t1, t2, t3, t4 = self._apply_whitening_to_timestamps(
+                t1, t2, t3, t4, message['channel_impulse_response']
+            )
         
         # Calculate round-trip time and offset
         rtt = (t4 - t1) - (t3 - t2)
@@ -212,6 +244,54 @@ class TWTTNode:
         synchronized_time = self.local_time_ns - consensus_offset
         
         return synchronized_time, uncertainty
+    
+    def _apply_whitening_to_timestamps(self, t1: int, t2: int, t3: int, t4: int, 
+                                      channel_impulse_response: np.ndarray) -> Tuple[int, int, int, int]:
+        """
+        Apply whitening filter to refine timestamp estimates
+        Extracts earliest path for accurate ToA
+        
+        Args:
+            t1, t2, t3, t4: TWTT timestamps
+            channel_impulse_response: Estimated channel response
+            
+        Returns:
+            Refined timestamps after whitening
+        """
+        if self.whitening_filter is None:
+            return t1, t2, t3, t4
+            
+        # Compute whitening filter for this channel
+        whitening_coeffs = self.whitening_filter.compute_whitening_filter(
+            channel_impulse_response,
+            snr_db=20  # Assume moderate SNR
+        )
+        
+        # Apply whitening to channel response
+        whitened_cir = self.whitening_filter.apply_whitening(
+            channel_impulse_response, 
+            whitening_coeffs
+        )
+        
+        # Extract refined time of arrival
+        # The whitening process sharpens the earliest path
+        sampling_rate = self.config.signal_bandwidth_mhz * 1e6
+        toa_correction, quality = self.whitening_filter.extract_time_of_arrival(
+            whitened_cir,
+            sampling_rate,
+            interpolation='parabolic'
+        )
+        
+        # Convert correction to nanoseconds
+        correction_ns = toa_correction * 1e9
+        
+        # Apply correction to timestamps
+        # The correction represents the difference between raw and whitened ToA
+        # Apply proportionally to forward and reverse paths
+        t2_refined = int(t2 - correction_ns / 2)
+        t3_refined = int(t3 - correction_ns / 2)
+        
+        return t1, t2_refined, t3_refined, t4
 
 
 class TWTTNeighborState:
